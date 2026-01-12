@@ -1,5 +1,6 @@
 import os
 import subprocess
+import shutil
 from typing import List, Dict, Any
 from core.elevenlabs_client import ElevenLabsClient
 
@@ -21,11 +22,15 @@ def generate_dubbed_audio(
     background_audio_path: str,
     segments: List[Dict[str, Any]],
     output_path: str,
-    temp_dir: str = "temp_tts"
+    temp_dir: str = "temp_tts",
+    cleanup_temp: bool = True  # Auto-delete temp files after mixing
 ) -> str:
     """
     Generates Hindi TTS using ElevenLabs and mixes with background.
     Processes segments SEQUENTIALLY to respect API concurrency limits.
+    
+    Args:
+        cleanup_temp: If True, deletes temp_dir after mixing to save storage.
     """
     print("=" * 50)
     print("STEP 6: Generating TTS (ElevenLabs) and Mixing")
@@ -128,4 +133,14 @@ def generate_dubbed_audio(
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     print(f"✅ Dubbed audio saved: {output_path}")
+    
+    # Cleanup temp TTS files to save storage
+    if cleanup_temp and os.path.exists(temp_dir):
+        try:
+            shutil.rmtree(temp_dir)
+            print(f"🧹 Cleaned up temp files: {temp_dir}")
+        except Exception as e:
+            print(f"⚠️ Could not cleanup temp dir: {e}")
+    
     return output_path
+

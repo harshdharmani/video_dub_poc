@@ -5,33 +5,42 @@ import subprocess
 from core.audioextractor import extract_audio
 from core.separator import separate_audio
 from core.transcribe import transcribe_audio
-from core.translator import Translator
+from core.translator import Translator, SUPPORTED_LANGUAGES
 from core.dubbing import generate_dubbed_audio
+from core.transcribe import LANGUAGE_MODEL_MAP
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION - EDIT THESE VALUES
 # ============================================================
-# Target language for dubbing (change this to switch languages)
-# Supported: hi (Hindi), ta (Tamil), te (Telugu), kn (Kannada), 
-#            ml (Malayalam), mr (Marathi), bn (Bengali), gu (Gujarati), pa (Punjabi)
+# Source language of the video (for transcription)
+# Use "multi" for auto-detect (recommended for mixed language videos)
+# Supported: multi (auto), en, hi, ta, te, kn, ml, mr, bn, gu, pa, or, as
+SOURCE_LANGUAGE = "multi"
+
+# Target language for dubbing (for translation + TTS)
+# Supported: en, hi, ta, te, kn, ml, mr, bn, gu, pa, or, as
 TARGET_LANGUAGE = "hi"
 
-# Paths
+# Input video path - change this to your video file
 VIDEO_PATH = "input/sample.mp4"
-ORIGINAL_AUDIO = "audio/original.wav"
-DUBBED_AUDIO = "audio/dubbed_final.aac"
-OUTPUT_VIDEO = "output/dubbed.mp4"
+
+# Output paths (auto-generated based on input filename and target language)
+video_basename = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
+ORIGINAL_AUDIO = f"audio/{video_basename}_original.wav"
+DUBBED_AUDIO = f"audio/{video_basename}_dubbed_{TARGET_LANGUAGE}.aac"
+OUTPUT_VIDEO = f"output/{video_basename}_{TARGET_LANGUAGE}.mp4"
 
 os.makedirs("audio", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
-# Language name mapping for display
-from core.translator import SUPPORTED_LANGUAGES
-LANGUAGE_NAME = SUPPORTED_LANGUAGES.get(TARGET_LANGUAGE, "Hindi")
+# Display config
+TARGET_LANG_NAME = SUPPORTED_LANGUAGES.get(TARGET_LANGUAGE, "Unknown")
 
 print("=" * 50)
 print(f"🎬 VIDEO DUBBING PIPELINE")
-print(f"   Target Language: {LANGUAGE_NAME} ({TARGET_LANGUAGE})")
+print(f"   Input:  {VIDEO_PATH}")
+print(f"   Source: {SOURCE_LANGUAGE} → Target: {TARGET_LANG_NAME} ({TARGET_LANGUAGE})")
+print(f"   Output: {OUTPUT_VIDEO}")
 print("=" * 50)
 
 # ============================================================
@@ -52,9 +61,9 @@ vocals_path, background_path = separate_audio(ORIGINAL_AUDIO)
 # STEP 3: Transcribe Vocals (Deepgram)
 # ============================================================
 print("=" * 50)
-print("STEP 3: Transcribing vocals (Deepgram with diarization)")
+print(f"STEP 3: Transcribing vocals ({SOURCE_LANGUAGE})")
 print("=" * 50)
-utterances = transcribe_audio(vocals_path)  # Transcribe CLEAN vocals
+utterances = transcribe_audio(vocals_path, source_language=SOURCE_LANGUAGE)
 print(f"✅ Got {len(utterances)} utterances")
 
 for utt in utterances[:3]:  # Show first 3
@@ -64,14 +73,14 @@ for utt in utterances[:3]:  # Show first 3
 # STEP 4: Translate to Target Language
 # ============================================================
 print("=" * 50)
-print(f"STEP 4: Translating to {LANGUAGE_NAME}")
+print(f"STEP 4: Translating to {TARGET_LANG_NAME}")
 print("=" * 50)
 translator = Translator(target_language=TARGET_LANGUAGE)
 translated_segments = translator.translate_segments(utterances)
 print(f"✅ Translated {len(translated_segments)} segments")
 
 # ============================================================
-# STEP 5 & 6: Generate Hindi TTS + Mix with Background
+# STEP 5 & 6: Generate TTS + Mix with Background
 # ============================================================
 generate_dubbed_audio(background_path, translated_segments, DUBBED_AUDIO)
 

@@ -1,14 +1,16 @@
 import os
 import json
-import google.generativeai as genai
+import time
+from google import genai
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
 
-# Supported languages for dubbing
+# Supported languages for dubbing (both source → target)
 SUPPORTED_LANGUAGES = {
+    "en": "English",
     "hi": "Hindi",
     "ta": "Tamil",
     "te": "Telugu",
@@ -18,30 +20,33 @@ SUPPORTED_LANGUAGES = {
     "bn": "Bengali",
     "gu": "Gujarati",
     "pa": "Punjabi",
+    "or": "Odia",
+    "as": "Assamese",
 }
 
 class Translator:
     def __init__(self, target_language: str = "hi"):
         """
         Initializes the Google Gemini Translator.
-        
+
         Args:
             target_language: Language code (hi, ta, te, kn, ml, etc.)
-                           Defaults to Hindi for backward compatibility.
+                             Defaults to Hindi for backward compatibility.
         """
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY not found. Please add it to your .env file.")
-        
+
         if target_language not in SUPPORTED_LANGUAGES:
             raise ValueError(f"Unsupported language: {target_language}. Supported: {list(SUPPORTED_LANGUAGES.keys())}")
-        
+
         self.target_language = target_language
         self.language_name = SUPPORTED_LANGUAGES[target_language]
-        
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
-        
+
+        # New client‑based initialization
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = "gemini-2.5-flash"
+
         print(f"🌐 Translator initialized for: {self.language_name} ({target_language})")
 
     def translate_segments(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -57,8 +62,8 @@ class Translator:
 
         print(f"Translating {len(segments)} segments to {self.language_name} with Gemini...")
         print(f"  → Passing timestamps and speaker info for context")
-        
-        # Prepare detailed segment info with duration for duration-aware translation
+
+        # Prepare detailed segment info with duration for duration‑aware translation
         detailed_segments = []
         for seg in segments:
             start = seg.get("start", 0.0)
@@ -66,18 +71,26 @@ class Translator:
             duration = end - start
             # Estimate max words: ~2.5 words/second is typical for Indian languages
             max_words = max(3, int(duration * 2.5))
-            
-            # Structure with dialogue text first for better LLM context
+
             detailed_segments.append({
                 "id": start,
-                "english_dialogue": seg.get("transcript", ""),  # Original dialogue - shown first for context
+                "english_dialogue": seg.get("transcript", ""),
                 "speaker": seg.get("speaker", 0),
-                "timestamp": f"{round(start, 2)}s - {round(end, 2)}s",  # Human-readable timestamp
+                "timestamp": f"{round(start, 2)}s - {round(end, 2)}s",
                 "duration_sec": round(duration, 2),
                 "max_words_allowed": max_words,
             })
 
-        prompt = f"""You are a professional dubbing translator for video/film content.
+        translated_segments_map = {}
+        
+        # Batch processing: Process in small chunks of 5 to avoid API overload and empty responses
+        BATCH_SIZE = 5
+        
+        for i in range(0, len(detailed_segments), BATCH_SIZE):
+            batch = detailed_segments[i : i + BATCH_SIZE]
+            print(f"  Processing batch {i//BATCH_SIZE + 1} ({len(batch)} segments)...")
+            
+            prompt = f"""You are a professional dubbing translator for video/film content.
 Translate the English dialogues to {self.language_name} and detect emotion.
 
 CRITICAL RULES FOR DUBBING:
@@ -87,7 +100,7 @@ CRITICAL RULES FOR DUBBING:
    - Prefer shorter synonyms and natural contractions.
    - If needed, summarize while preserving core meaning.
 
-2. **DIALOGUE CONTEXT**: 
+2. **DIALOGUE CONTEXT**:
    - 'english_dialogue' shows what was spoken at that timestamp.
    - 'timestamp' shows when the dialogue occurs (e.g., "2.5s - 5.0s").
    - Use this context to understand conversation flow and pacing.
@@ -109,62 +122,131 @@ CRITICAL RULES FOR DUBBING:
    - Make it sound like native {self.language_name} speakers would say it.
 
 Input Segments (with English dialogue and timing):
-{json.dumps(detailed_segments, indent=2, ensure_ascii=False)}
+{json.dumps(batch, indent=2, ensure_ascii=False)}
 
 Return ONLY the JSON array, no other text."""
 
-        try:
-            response = self.model.generate_content(prompt)
+            # Retry logic for 503 Service Unavailable / Overload
+            MAX_RETRIES = 3
+            success = False
             
-            # Clean up response text (remove markdown code blocks if present)
-            result_text = response.text.strip()
-            if result_text.startswith("```json"):
-                result_text = result_text[7:]
-            if result_text.startswith("```"):
-                result_text = result_text[3:]
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-            
-            translated_data = json.loads(result_text.strip())
-            
-            # Map back to original segments structure
-            translation_map = {
-                item["id"]: {
-                    "text": item["text"], 
-                    "emotion": item.get("emotion", "neutral")
-                } 
-                for item in translated_data
-            }
-            
-            final_segments = []
-            for seg in segments:
-                original_id = seg.get("start")
-                new_seg = seg.copy()
-                if original_id in translation_map:
-                    new_seg["transcript"] = translation_map[original_id]["text"]
-                    new_seg["emotion"] = translation_map[original_id]["emotion"]
-                    print(f"  ✅ [{original_id:.1f}s] Speaker {seg.get('speaker', 0)}: {new_seg['transcript'][:40]}...")
-                else:
-                    print(f"  ⚠️ Missing translation for segment at {original_id}s")
-                final_segments.append(new_seg)
-                
-            print(f"✅ Translation complete: {len(final_segments)} segments in {self.language_name}")
-            return final_segments
+            for attempt in range(MAX_RETRIES):
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=prompt,
+                        config={
+                            "temperature": 0.3,
+                            "max_output_tokens": 8000,
+                            "response_schema": self._output_schema(),
+                            "response_mime_type": "application/json",
+                        },
+                    )
 
-        except Exception as e:
-            print(f"❌ Gemini Translation Failed: {e}")
-            # Fallback: Return original segments if failure
-            print("Fallback: Returning original English segments.")
-            return segments
+                    batch_data = response.parsed
+                    if batch_data:
+                        for item in batch_data:
+                            # Handle both object attributes (dot notation) and dictionary keys
+                            if isinstance(item, dict):
+                                item_id = item.get("id")
+                                item_text = item.get("text")
+                                item_emotion = item.get("emotion", "neutral")
+                            else:
+                                item_id = item.id
+                                item_text = item.text
+                                item_emotion = getattr(item, "emotion", "neutral")
+
+                            translated_segments_map[item_id] = {
+                                "text": item_text,
+                                "emotion": item_emotion
+                            }
+                        success = True
+                        break # Success, exit retry loop
+                    else:
+                        print(f"  ⚠️ Warning: Batch {i//BATCH_SIZE + 1} returned None (empty). Retrying...")
+                        # This can happen on transient model errors, so we SHOULD retry
+                        # Fall through to exception-like retry logic
+                        time.sleep(2)
+
+                except Exception as e:
+                    print(f"  ⚠️ Batch {i//BATCH_SIZE + 1} attempt {attempt+1}/{MAX_RETRIES} failed: {e}")
+                
+                # Retry logic for both Exception and None result
+                if not success:
+                    if attempt < MAX_RETRIES - 1:
+                        wait_time = (2 ** attempt) * 5 # 5s, 10s, 20s
+                        print(f"     Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"  ❌ Batch {i//BATCH_SIZE + 1} permanently failed.")
+
+            if success:
+                time.sleep(2) # Increased delay between batches for safety
+
+        # Map back to original segments structure using the accumulated map
+        final_segments = []
+        for seg in segments:
+            original_id = seg.get("start")
+            new_seg = seg.copy()
+            if original_id in translated_segments_map:
+                new_seg["transcript"] = translated_segments_map[original_id]["text"]
+                new_seg["emotion"] = translated_segments_map[original_id]["emotion"]
+                print(f"  ✅ [{original_id:.1f}s] Speaker {seg.get('speaker', 0)}: {new_seg['transcript'][:40]}...")
+            else:
+                print(f"  ⚠️ Missing translation for segment at {original_id}s")
+            final_segments.append(new_seg)
+
+        print(f"✅ Translation complete: {len(final_segments)} segments in {self.language_name}")
+        return final_segments
+
 
     def translate(self, text: str) -> str:
         """Single text translation (Legacy support)"""
         if not text:
             return ""
         try:
-            response = self.model.generate_content(
-                f"Translate this to {self.language_name} (natural, conversational): {text}"
+            # FIX: Nest the response_schema inside 'config'
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=f"Translate this to {self.language_name} (natural, conversational): {text}",
+                config={
+                    "temperature": 0.7, 
+                    "max_output_tokens": 500,
+                    "response_mime_type": "application/json",
+                    "response_schema": self._output_schema(single=True)
+                }
             )
-            return response.text.strip()
-        except:
+            # Use .parsed for clean output if using schema, otherwise .text
+            return response.parsed.text if hasattr(response, 'parsed') else response.text.strip()
+        except Exception as e:
+            print(f"Single translation failed: {e}")
             return text
+    def _output_schema(self, single: bool = False) -> dict:
+        """Return JSON schema for Gemini controlled generation.
+        If *single* is True, the schema describes a single object with `text`
+        and optional `emotion`. Otherwise it describes an array of objects
+        each containing `id`, `text`, and optional `emotion`.
+        """
+        if single:
+            return {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "emotion": {"type": "string"},
+                },
+                "required": ["text"],
+            }
+        else:
+            return {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "number"},
+                        "text": {"type": "string"},
+                        "emotion": {"type": "string"},
+                    },
+                    "required": ["id", "text"],
+                },
+            }
+
