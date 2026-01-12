@@ -8,6 +8,14 @@ from core.transcribe import transcribe_audio
 from core.translator import Translator
 from core.dubbing import generate_dubbed_audio
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+# Target language for dubbing (change this to switch languages)
+# Supported: hi (Hindi), ta (Tamil), te (Telugu), kn (Kannada), 
+#            ml (Malayalam), mr (Marathi), bn (Bengali), gu (Gujarati), pa (Punjabi)
+TARGET_LANGUAGE = "hi"
+
 # Paths
 VIDEO_PATH = "input/sample.mp4"
 ORIGINAL_AUDIO = "audio/original.wav"
@@ -16,6 +24,15 @@ OUTPUT_VIDEO = "output/dubbed.mp4"
 
 os.makedirs("audio", exist_ok=True)
 os.makedirs("output", exist_ok=True)
+
+# Language name mapping for display
+from core.translator import SUPPORTED_LANGUAGES
+LANGUAGE_NAME = SUPPORTED_LANGUAGES.get(TARGET_LANGUAGE, "Hindi")
+
+print("=" * 50)
+print(f"🎬 VIDEO DUBBING PIPELINE")
+print(f"   Target Language: {LANGUAGE_NAME} ({TARGET_LANGUAGE})")
+print("=" * 50)
 
 # ============================================================
 # STEP 1: Extract Audio from Video
@@ -35,26 +52,23 @@ vocals_path, background_path = separate_audio(ORIGINAL_AUDIO)
 # STEP 3: Transcribe Vocals (Deepgram)
 # ============================================================
 print("=" * 50)
-print("STEP 3: Transcribing vocals (Deepgram)")
+print("STEP 3: Transcribing vocals (Deepgram with diarization)")
 print("=" * 50)
 utterances = transcribe_audio(vocals_path)  # Transcribe CLEAN vocals
 print(f"✅ Got {len(utterances)} utterances")
 
 for utt in utterances[:3]:  # Show first 3
-    print(f"  [{utt['start']:.1f}s - {utt['end']:.1f}s]: {utt['transcript'][:50]}...")
+    print(f"  [Speaker {utt.get('speaker', 0)}] [{utt['start']:.1f}s - {utt['end']:.1f}s]: {utt['transcript'][:50]}...")
 
 # ============================================================
-# STEP 4: Translate to Hindi
+# STEP 4: Translate to Target Language
 # ============================================================
 print("=" * 50)
-print("STEP 4: Translating to Hindi")
+print(f"STEP 4: Translating to {LANGUAGE_NAME}")
 print("=" * 50)
-translator = Translator()
+translator = Translator(target_language=TARGET_LANGUAGE)
 translated_segments = translator.translate_segments(utterances)
 print(f"✅ Translated {len(translated_segments)} segments")
-
-for seg in translated_segments[:3]:  # Show first 3
-    print(f"  [{seg['start']:.1f}s]: {seg['transcript'][:50]}...")
 
 # ============================================================
 # STEP 5 & 6: Generate Hindi TTS + Mix with Background
