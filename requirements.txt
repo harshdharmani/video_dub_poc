@@ -1,0 +1,8 @@
+torch
+transformers
+sentencepiece
+deepgram-sdk
+python-dotenv
+demucs
+google-generativeai
+elevenlabs
