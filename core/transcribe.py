@@ -1,289 +1,404 @@
 import os
 import subprocess
-from typing import List, Dict, Any, Optional, Tuple
+import tempfile
+import uuid
+import time
+from typing import List, Dict, Any, Union
 from dotenv import load_dotenv
-from deepgram import DeepgramClient
+from google.cloud.speech_v2 import SpeechClient
+from google.cloud.speech_v2.types import cloud_speech
+from google.api_core.client_options import ClientOptions
+import google.api_core.exceptions
+from google.cloud import storage
 
 # Load .env from project root safely
 load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
 
-# Language to Deepgram model mapping
-# Nova-3 supports: English, Hindi, and many European languages
-# Whisper supports: 50+ languages including all Indian regional languages
-LANGUAGE_MODEL_MAP = {
-    # Languages supported by Nova-3 (faster, more accurate for these)
-    "en": {"model": "nova-3", "code": "en"},
-    "hi": {"model": "nova-3", "code": "hi"},
-    
-    # Indian regional languages - use Whisper (supports these natively)
-    "ta": {"model": "whisper-large", "code": "ta"},   # Tamil
-    "te": {"model": "whisper-large", "code": "te"},   # Telugu
-    "kn": {"model": "whisper-large", "code": "kn"},   # Kannada
-    "ml": {"model": "whisper-large", "code": "ml"},   # Malayalam
-    "mr": {"model": "whisper-large", "code": "mr"},   # Marathi
-    "bn": {"model": "whisper-large", "code": "bn"},   # Bengali
-    "gu": {"model": "whisper-large", "code": "gu"},   # Gujarati
-    "pa": {"model": "whisper-large", "code": "pa"},   # Punjabi
-    "or": {"model": "whisper-large", "code": "or"},   # Odia
-    "as": {"model": "whisper-large", "code": "as"},   # Assamese
-    
-    # Auto-detect (for mixed language videos)
-    "multi": {"model": "nova-3", "code": "multi"},
-}
 
-def get_supported_languages() -> List[str]:
-    """Returns list of supported source language codes."""
-    return list(LANGUAGE_MODEL_MAP.keys())
-
-
-def _extract_audio_chunk(audio_path: str, start: float, end: float, output_path: str) -> str:
-    """Extracts a chunk of audio using FFmpeg."""
-    duration = end - start
+def get_audio_duration(file_path: str) -> float:
+    """Returns the duration of an audio file in seconds using ffprobe."""
     cmd = [
-        "ffmpeg", "-y",
-        "-i", audio_path,
-        "-ss", str(start),
-        "-t", str(duration),
-        "-acodec", "pcm_s16le",
-        "-ar", "16000",
-        output_path
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return output_path
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return float(result.stdout.strip())
+    except (ValueError, IndexError, Exception):
+        return 0.0
 
 
-def _diarize_audio(audio_path: str, api_key: str) -> List[Dict[str, Any]]:
+def split_audio_into_chunks(audio_path: str, chunk_duration: float = 240.0, temp_dir: str = None) -> List[Dict]:
     """
-    PASS 1: Get speaker diarization using Nova-3 with multi-language support.
-    Returns speaker segments with timestamps (no transcription yet).
+    Splits an audio file into chunks. 
+    Using 240s (4 mins) chunks since BatchRecognize can handle longer files more efficiently than Sync.
     """
-    print("  📢 Pass 1: Diarization with Nova-3 (language=multi)")
+    total_duration = get_audio_duration(audio_path)
+    if total_duration == 0:
+        return []
     
-    deepgram = DeepgramClient(api_key=api_key)
+    if temp_dir is None:
+        temp_dir = tempfile.mkdtemp(prefix="stt_chunks_")
     
-    with open(audio_path, "rb") as audio_file:
-        response = deepgram.listen.v1.media.transcribe_file(
-            request=audio_file.read(),
-            model="nova-3",
-            language="multi",  # Multi-language for mixed content
-            diarize=True,
-            utterances=True,
-            smart_format=True,
-            punctuate=True
-        )
+    os.makedirs(temp_dir, exist_ok=True)
     
-    segments = []
-    if response.results and response.results.utterances:
-        for utt in response.results.utterances:
-            segments.append({
-                "start": float(utt.start),
-                "end": float(utt.end),
-                "speaker": int(utt.speaker) if hasattr(utt, 'speaker') and utt.speaker is not None else 0,
-                "transcript": utt.transcript.strip()  # Nova-3 transcription (may be rough for non-en/hi)
+    chunks = []
+    start_time = 0.0
+    chunk_index = 0
+    
+    while start_time < total_duration:
+        chunk_path = os.path.join(temp_dir, f"chunk_{chunk_index}.wav")
+        
+        # Use ffmpeg to extract chunk and convert to LINEAR16 WAV
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", audio_path,
+            "-ss", str(start_time),
+            "-t", str(chunk_duration),
+            "-ar", "16000",
+            "-ac", "1",
+            "-acodec", "pcm_s16le",
+            chunk_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        if os.path.exists(chunk_path):
+            chunks.append({
+                "path": chunk_path,
+                "start_offset": start_time
             })
+        
+        start_time += chunk_duration
+        chunk_index += 1
     
-    speakers = set(seg["speaker"] for seg in segments)
-    print(f"  ✅ Found {len(segments)} segments with {len(speakers)} speaker(s)")
-    return segments
+    return chunks
 
 
-def _transcribe_chunk(audio_path: str, api_key: str, language: str = "en") -> str:
+def create_recognizer_if_missing(
+    client: SpeechClient,
+    project_id: str,
+    region: str,
+    recognizer_id: str,
+    language_codes: List[str]
+):
     """
-    PASS 2: Transcribe a single audio chunk with the appropriate model.
-    For regional languages, uses Whisper which auto-detects if needed.
+    Creates a persistent Recognizer with Chirp 3 and Diarization enabled if it doesn't exist.
     """
-    if language not in LANGUAGE_MODEL_MAP:
-        language = "en"
+    parent = f"projects/{project_id}/locations/{region}"
+    resource_path = f"{parent}/recognizers/{recognizer_id}"
     
-    config = LANGUAGE_MODEL_MAP[language]
-    model = config["model"]
-    lang_code = config["code"]
+    try:
+        client.get_recognizer(name=resource_path)
+        print(f"  [+] Recognizer '{recognizer_id}' already exists.")
+        return resource_path
+    except google.api_core.exceptions.NotFound:
+        print(f"  [+] Creating new recognizer: {recognizer_id}...")
     
-    deepgram = DeepgramClient(api_key=api_key)
+    request = cloud_speech.CreateRecognizerRequest(
+        parent=parent,
+        recognizer_id=recognizer_id,
+        recognizer=cloud_speech.Recognizer(
+            model="chirp_3",
+            language_codes=language_codes,
+            default_recognition_config=cloud_speech.RecognitionConfig(
+                features=cloud_speech.RecognitionFeatures(
+                    enable_word_time_offsets=True,
+                    enable_automatic_punctuation=True,
+                )
+            )
+        ),
+    )
     
-    with open(audio_path, "rb") as audio_file:
-        response = deepgram.listen.v1.media.transcribe_file(
-            request=audio_file.read(),
-            model=model,
-            language=lang_code,
-            smart_format=True,
-            punctuate=True
+    try:
+        operation = client.create_recognizer(request=request)
+        operation.result(timeout=120)
+        print(f"  [+] Recognizer created successfully.")
+        return resource_path
+    except Exception as e:
+        print(f"  [-] Failed to create recognizer: {e}")
+        raise e
+
+
+def upload_to_gcs(bucket_name: str, source_file_name: str, destination_blob_name: str) -> str:
+    """Uploads a file to the bucket and returns the GS URI."""
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_filename(source_file_name)
+    return f"gs://{bucket_name}/{destination_blob_name}"
+
+
+def delete_from_gcs(bucket_name: str, blob_name: str):
+    """Deletes a blob from the bucket."""
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.delete()
+    except Exception as e:
+        print(f"  [!] Failed to delete GCS blob {blob_name}: {e}")
+
+
+def transcribe_chunk_batch(
+    client: SpeechClient, 
+    local_audio_path: str, 
+    recognizer_path: str,
+    bucket_name: str
+) -> List[Dict]:
+    """
+    Transcribes a chunk by uploading to GCS, running BatchRecognize, and parsing inline results.
+    """
+    # 1. Upload to GCS
+    blob_name = f"temp_chunks/{uuid.uuid4()}.wav"
+    gcs_uri = upload_to_gcs(bucket_name, local_audio_path, blob_name)
+    # print(f"      Uploaded to {gcs_uri}")
+    
+    try:
+        # 2. Batch Recognize
+        # Explicitly include features in the request config to ensure they are active
+        # and not disabled by the override.
+        diarization_config = cloud_speech.SpeakerDiarizationConfig(
+            min_speaker_count=2, # Force at least 2 speakers to encourage splitting
+            max_speaker_count=7,
         )
-    
-    if response.results and response.results.channels:
-        alternatives = response.results.channels[0].alternatives
-        if alternatives:
-            return alternatives[0].transcript.strip()
-    
-    return ""
+        features = cloud_speech.RecognitionFeatures(
+            diarization_config=diarization_config,
+            enable_word_time_offsets=True,
+            enable_automatic_punctuation=True,
+        )
+        
+        config = cloud_speech.RecognitionConfig(
+            auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
+            language_codes=["auto"],
+            model="chirp_3",
+            features=features,
+        )
+        
+        batch_request = cloud_speech.BatchRecognizeRequest(
+            recognizer=recognizer_path,
+            config=config,
+            files=[cloud_speech.BatchRecognizeFileMetadata(uri=gcs_uri)],
+            recognition_output_config=cloud_speech.RecognitionOutputConfig(
+                inline_response_config=cloud_speech.InlineOutputConfig()
+            ),
+        )
+        
+        operation = client.batch_recognize(request=batch_request)
+        print(f"      Job started (Async). Waiting for completion...")
+        
+        # Poll for completion with feedback
+        start_wait = time.time()
+        while not operation.done():
+            elapsed = int(time.time() - start_wait)
+            print(f"\r      ... {elapsed}s elapsed", end="", flush=True)
+            time.sleep(5)
+            if elapsed > 900: # 15 min timeout per chunk
+                 print("\n      [!] Timeout reached.")
+                 operation.cancel()
+                 break
+        print("") # Newline
+        
+        # Get result
+        response = operation.result()
+        
+        segments = []
+        
+        # 3. Parse Results
+        # Response contains results keyed by URI
+        if gcs_uri in response.results:
+            file_result = response.results[gcs_uri]
+            
+            # Check for errors
+            if file_result.error and file_result.error.code != 0:
+                print(f"      [!] Batch Error for chunk: {file_result.error.message}")
+                return []
+            
+            # Parse transcript
+            if file_result.transcript and file_result.transcript.results:
+                for result in file_result.transcript.results:
+                    if result.alternatives:
+                        alternative = result.alternatives[0]
+                        # transcript = alternative.transcript # Not used directly if we parse words
+                        
+                        if alternative.words:
+                            current_speaker = 0
+                            segment_words = []
+                            segment_start = alternative.words[0].start_offset.total_seconds()
+                            prev_word_end = segment_start # Initialize
+                            
+                            # DEBUG: Check first word attributes for speaker tags
+                            first_word = alternative.words[0]
+                            print(f"      [DEBUG] First word: '{first_word.word}', Speaker Tag: {getattr(first_word, 'speaker_tag', 'Missing')}, Label: {getattr(first_word, 'speaker_label', 'Missing')}")
+
+                            for word in alternative.words:
+                                speaker_tag = getattr(word, 'speaker_tag', 0)
+                                speaker_id = int(speaker_tag) if speaker_tag else 0
+                                
+                                word_start = word.start_offset.total_seconds()
+                                word_end = word.end_offset.total_seconds()
+                                
+                                # Split Condition 1: Speaker Change
+                                speaker_changed = (speaker_id != current_speaker)
+                                
+                                # Split Condition 2: Silence Gap > 0.7s (Natural Pause)
+                                silence_gap = (word_start - prev_word_end) if prev_word_end > 0 else 0
+                                is_pause = silence_gap > 0.7
+                                
+                                # Split Condition 3: Segment too long (> 30s) AND pause > 0.3s (Soft split)
+                                is_too_long = (word_start - segment_start) > 30.0 and silence_gap > 0.3
+                                
+                                if (speaker_changed or is_pause or is_too_long) and segment_words:
+                                     # End previous segment
+                                     segments.append({
+                                         "start": segment_start,
+                                         "end": prev_word_end,
+                                         "speaker": current_speaker,
+                                         "transcript": " ".join(segment_words)
+                                     })
+                                     # Start new segment
+                                     current_speaker = speaker_id
+                                     segment_words = [word.word]
+                                     segment_start = word_start
+                                     prev_word_end = word_end
+                                else:
+                                    if not segment_words:
+                                        current_speaker = speaker_id
+                                        segment_start = word_start
+                                    segment_words.append(word.word)
+                                    prev_word_end = word_end
+                            
+                            if segment_words:
+                                 # Use the last word end
+                                 segments.append({
+                                     "start": segment_start,
+                                     "end": prev_word_end,
+                                     "speaker": current_speaker,
+                                     "transcript": " ".join(segment_words)
+                                 })
+            else:
+                 print(f"      [!] No transcript found in response.")
+
+        return segments
+
+    finally:
+        # 4. cleanup GCS
+        delete_from_gcs(bucket_name, blob_name)
 
 
 def transcribe_audio(
     audio_path: str, 
-    source_language: str = "en",
-    enable_diarization: bool = True,
-    use_two_pass: bool = True,
-    temp_dir: str = "temp_chunks"
+    source_language: str = "multi", 
+    enable_diarization: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Transcribes audio with speaker diarization support for any language.
-    
-    TWO-PASS APPROACH (for regional languages with diarization):
-    - Pass 1: Nova-3 with diarize=true, language=multi → get speaker timestamps
-    - Pass 2: For each speaker segment, transcribe with appropriate model
-    
-    Args:
-        audio_path: Path to the audio file
-        source_language: ISO 639-1 language code (en, hi, ta, te, kn, ml, etc.)
-        enable_diarization: Enable speaker diarization
-        use_two_pass: Use two-pass method for regional languages (recommended)
-        temp_dir: Directory for temporary audio chunks
-
-    Output format:
-    [
-        {"start": 0.0, "end": 2.5, "transcript": "Hello", "speaker": 0},
-        ...
-    ]
+    Transcribes audio using Google Cloud Speech-to-Text v2 API (Chirp 3) via BatchRecognize.
+    Uses a temporary GCS bucket for upload/processing.
     """
-    print(f"Transcribing audio with Deepgram...")
-    print(f"  → Source language: {source_language}")
+    print(f"Transcribing audio (Batch Mode) with Google Cloud Speech-to-Text (Source: {source_language})...")
     
-    # --- Validate API Key ---
-    api_key = os.getenv("DEEPGRAM_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPGRAM_API_KEY not found. Check your .env file.")
+    project_id = os.getenv("GCP_PROJECT_ID")
+    gcp_region = os.getenv("GCP_REGION", "us")
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    # Get Bucket Name (Env or Fallback)
+    bucket_name = os.getenv("GCS_BUCKET_NAME", "dub_poc_bucket")
     
-    # Determine if we need two-pass (for regional languages that need diarization)
-    is_regional = source_language in ["ta", "te", "kn", "ml", "mr", "bn", "gu", "pa", "or", "as"]
-    needs_two_pass = use_two_pass and enable_diarization and is_regional
-    
-    if needs_two_pass:
-        print(f"  → Using TWO-PASS method (diarization + regional language)")
-        return _two_pass_transcribe(audio_path, api_key, source_language, temp_dir)
-    else:
-        print(f"  → Using SINGLE-PASS method")
-        return _single_pass_transcribe(audio_path, api_key, source_language, enable_diarization)
-
-
-def _single_pass_transcribe(
-    audio_path: str, 
-    api_key: str, 
-    source_language: str,
-    enable_diarization: bool
-) -> List[Dict[str, Any]]:
-    """Single-pass transcription (for en/hi or when diarization not needed)."""
-    
-    if source_language not in LANGUAGE_MODEL_MAP:
-        print(f"⚠️ Language '{source_language}' not in map, defaulting to English")
-        source_language = "en"
-    
-    config = LANGUAGE_MODEL_MAP[source_language]
-    model = config["model"]
-    lang_code = config["code"]
-    
-    print(f"  → Model: {model}")
-    
-    # Whisper doesn't support diarization
-    use_diarization = enable_diarization and not model.startswith("whisper")
-    if enable_diarization and model.startswith("whisper"):
-        print(f"  ⚠️ Diarization not available for Whisper model")
-    if use_diarization:
-        print(f"  → Speaker diarization: ENABLED")
-
-    deepgram = DeepgramClient(api_key=api_key)
-
-    with open(audio_path, "rb") as audio_file:
-        response = deepgram.listen.v1.media.transcribe_file(
-            request=audio_file.read(),
-            model=model,
-            language=lang_code,
-            smart_format=True,
-            punctuate=True,
-            utterances=True,
-            diarize=use_diarization
-        )
-
-    segments: List[Dict[str, Any]] = []
-
-    if response.results and response.results.utterances:
-        for utt in response.results.utterances:
-            segment = {
-                "start": float(utt.start),
-                "end": float(utt.end),
-                "transcript": utt.transcript.strip(),
-                "speaker": int(utt.speaker) if hasattr(utt, 'speaker') and utt.speaker is not None else 0
-            }
-            segments.append(segment)
-        
-        speakers = set(seg["speaker"] for seg in segments)
-        print(f"  ✅ Found {len(segments)} segments with {len(speakers)} speaker(s)")
-        return segments
-
-    # Fallback for no utterances
-    if response.results and response.results.channels:
-        alternatives = response.results.channels[0].alternatives
-        if alternatives and alternatives[0].transcript:
-            return [{
-                "start": 0.0,
-                "end": 0.0,
-                "transcript": alternatives[0].transcript.strip(),
-                "speaker": 0
-            }]
-
-    return []
-
-
-def _two_pass_transcribe(
-    audio_path: str, 
-    api_key: str, 
-    source_language: str,
-    temp_dir: str
-) -> List[Dict[str, Any]]:
-    """
-    Two-pass transcription for regional languages with diarization.
-    Pass 1: Diarization with Nova-3 (multi) → speaker timestamps
-    Pass 2: Transcribe each chunk with Whisper → accurate transcription
-    """
-    import shutil
-    
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # PASS 1: Get diarization (speaker timestamps)
-    diarized_segments = _diarize_audio(audio_path, api_key)
-    
-    if not diarized_segments:
-        print("  ⚠️ No segments found in diarization pass")
+    if not project_id or not credentials_path:
+        print("[-] Error: Missing GCP_PROJECT_ID or GOOGLE_APPLICATION_CREDENTIALS.")
         return []
-    
-    # PASS 2: Transcribe each segment with appropriate model
-    print(f"  📝 Pass 2: Transcribing {len(diarized_segments)} chunks with Whisper")
-    
-    final_segments = []
-    for i, seg in enumerate(diarized_segments):
-        chunk_path = os.path.join(temp_dir, f"chunk_{i}.wav")
         
-        # Extract audio chunk
-        _extract_audio_chunk(audio_path, seg["start"], seg["end"], chunk_path)
-        
-        # Transcribe chunk with language-specific model
-        if os.path.exists(chunk_path):
-            transcript = _transcribe_chunk(chunk_path, api_key, source_language)
-            
-            # Use Whisper transcription if available, else fall back to Nova-3
-            if transcript:
-                seg["transcript"] = transcript
-            
-            final_segments.append(seg)
-            print(f"    [{seg['start']:.1f}s] Speaker {seg['speaker']}: {seg['transcript'][:40]}...")
+    if not os.path.exists(audio_path):
+        print(f"[-] Audio file not found: {audio_path}")
+        return []
+
+    # ALL_INDIAN_LANGUAGES (Without pa-IN)
+    ALL_INDIAN_LANGUAGES = [
+        "en-US", "hi-IN", "bn-IN", "ta-IN", "te-IN", 
+        "kn-IN", "ml-IN", "gu-IN", "mr-IN", "or-IN"
+    ]
+
+    if source_language == "multi":
+        # Supports "auto" for universal detection as requested
+        language_codes = ["auto"]
+        print(f"  Language Detection: Auto Mode (Universal)")
+    else:
+        single_lang_map = {
+            "en": "en-US", "hi": "hi-IN", "ta": "ta-IN", "te": "te-IN",
+            "kn": "kn-IN", "ml": "ml-IN", "mr": "mr-IN", "bn": "bn-IN",
+            "gu": "gu-IN", "or": "or-IN", "as": "as-IN",
+        }
+        lang_code = single_lang_map.get(source_language, "en-US")
+        language_codes = [lang_code]
+        print(f"  Language set to: {lang_code}")
     
-    # Cleanup temp chunks
     try:
-        shutil.rmtree(temp_dir)
-        print(f"  🧹 Cleaned up temp chunks")
-    except:
-        pass
-    
-    print(f"  ✅ Two-pass transcription complete: {len(final_segments)} segments")
-    return final_segments
-
-
+        client_options = ClientOptions(api_endpoint=f"{gcp_region}-speech.googleapis.com")
+        client = SpeechClient(client_options=client_options)
+        
+        print(f"  Using GCS Bucket: {bucket_name}")
+        
+        RECOGNIZER_ID = "voice-dub-chirp3-diarizer-v7"
+        print(f"  --> Ensuring Recognizer '{RECOGNIZER_ID}' exists...")
+        recognizer_path = create_recognizer_if_missing(
+            client=client,
+            project_id=project_id,
+            region=gcp_region,
+            recognizer_id=RECOGNIZER_ID,
+            language_codes=language_codes
+        )
+        
+        total_duration = get_audio_duration(audio_path)
+        print(f"  Audio duration: {total_duration:.1f} seconds")
+        
+        all_segments = []
+        
+        # Split into chunks (Can use longer chunks now, e.g., 240s)
+        # We process chunks sequentially to update user (could be parallelized)
+        chunks = split_audio_into_chunks(audio_path, chunk_duration=240.0)
+        print(f"  --> Processing {len(chunks)} chunks via BatchRecognize...")
+        
+        for i, chunk in enumerate(chunks):
+            print(f"  --> Processing chunk {i+1}/{len(chunks)} (start: {chunk['start_offset']:.1f}s)...")
+            
+            try:
+                chunk_segments = transcribe_chunk_batch(
+                    client=client,
+                    local_audio_path=chunk["path"],
+                    recognizer_path=recognizer_path,
+                    bucket_name=bucket_name
+                )
+                
+                # Adjust timestamps
+                if chunk_segments:
+                    for seg in chunk_segments:
+                        seg["start"] += chunk["start_offset"]
+                        seg["end"] += chunk["start_offset"]
+                        all_segments.append(seg)
+                    print(f"      Got {len(chunk_segments)} segments.")
+                
+            except Exception as e:
+                print(f"      [!] Error processing chunk {i+1}: {e}")
+                # Optional: Import traceback and print
+            
+            # Cleanup local chunk
+            try:
+                os.remove(chunk["path"])
+            except:
+                pass
+        
+        # Cleanup temp dir
+        if chunks:
+            try:
+                os.rmdir(os.path.dirname(chunks[0]["path"]))
+            except:
+                pass
+                
+        print(f"  [+] Transcription complete: {len(all_segments)} segments.")
+        return all_segments
+        
+    except Exception as e:
+        print(f"[-] Transcription failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return []

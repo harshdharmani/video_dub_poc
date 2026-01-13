@@ -22,6 +22,7 @@ def generate_dubbed_audio(
     background_audio_path: str,
     segments: List[Dict[str, Any]],
     output_path: str,
+    language: str = "hi", # Added language parameter
     temp_dir: str = "temp_tts",
     cleanup_temp: bool = True  # Auto-delete temp files after mixing
 ) -> str:
@@ -49,57 +50,65 @@ def generate_dubbed_audio(
         print(f"❌ Failed to init ElevenLabs: {e}")
         return background_audio_path
     
-    tts_files = []
+    tts_audio_files = []
     print(f"Processing {len(segments)} segments sequentially...")
     
-    for i, segment in enumerate(segments):
-        text = segment.get("transcript", "").strip()
-        speaker_id = segment.get("speaker", 0)
-        target_duration = segment.get("end", 0.0) - segment.get("start", 0.0)
-        start_time = segment.get("start", 0.0)
+    for i, seg in enumerate(segments):
+        start_time = seg.get("start", 0)
+        original_text = seg.get("transcript", "")
+        # Use simple mapping for speaker ID if available, else 0
+        speaker_id = seg.get("speaker", 0) 
+        target_duration = seg.get("end", 0.0) - seg.get("start", 0.0)
         
-        if not text:
+        # Skip empty segments
+        if not original_text.strip():
             continue
             
-        tts_filename = os.path.join(temp_dir, f"segment_{i}.mp3")
+        temp_file = os.path.join(temp_dir, f"segment_{i}_{start_time}.mp3")
         
         try:
             # Generate TTS (blocking/sequential)
-            el_client.generate_dub(text, tts_filename, speaker_id=speaker_id)
+            # Pass language and speaker_id
+            audio_path = el_client.generate_dub(
+                text=original_text, 
+                output_path=temp_file, 
+                speaker_id=speaker_id,
+                language=language
+            )
             
-            if not os.path.exists(tts_filename):
+            if not os.path.exists(temp_file):
                 continue
             
             # Duration Sync check
-            current_duration = get_audio_duration(tts_filename)
-            final_segment_path = tts_filename
+            current_duration = get_audio_duration(temp_file)
+            final_segment_path = temp_file
             
             # Speed up if TTS is longer than original slot
             if current_duration > target_duration * 1.05 and target_duration > 0.5:
                 speed_factor = min(current_duration / target_duration, 1.3)
                 
-                speed_filename = tts_filename.replace(".mp3", "_fast.mp3")
+                speed_filename = temp_file.replace(".mp3", "_fast.mp3")
                 subprocess.run([
-                    "ffmpeg", "-y", "-i", tts_filename,
+                    "ffmpeg", "-y", "-i", temp_file,
                     "-filter:a", f"atempo={speed_factor}",
                     "-vn", speed_filename
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
                 if os.path.exists(speed_filename):
                     final_segment_path = speed_filename
-
-            tts_files.append({"path": final_segment_path, "start": start_time})
-
+        
+            tts_audio_files.append({"path": final_segment_path, "start": start_time})
+        
         except Exception as e:
             print(f"  ❌ Segment {i} failed: {e}")
 
-    if not tts_files:
+    if not tts_audio_files:
         print("No TTS generated.")
         return background_audio_path
 
     # Build FFmpeg mix command
     cmd = ["ffmpeg", "-y", "-i", background_audio_path]
-    for tts in tts_files:
+    for tts in tts_audio_files:
         cmd.extend(["-i", tts["path"]])
 
     filter_complex = []
@@ -107,17 +116,20 @@ def generate_dubbed_audio(
     
     filter_complex.append("[0:a]aformat=sample_rates=44100:channel_layouts=stereo[bg]")
 
-    for i, tts in enumerate(tts_files):
+    for i, tts in enumerate(tts_audio_files):
         delay_ms = int(tts["start"] * 1000)
         chain = f"[{i+1}:a]aformat=sample_rates=44100:channel_layouts=stereo,adelay={delay_ms}|{delay_ms}[tts{i}]"
         filter_complex.append(chain)
         dialogue_inputs.append(f"[tts{i}]")
 
     mix_str = "".join(dialogue_inputs)
-    filter_complex.append(f"{mix_str}amix=inputs={len(tts_files)}:dropout_transition=0[dialogue]")
-    filter_complex.append("[bg]volume=0.5[bg_quiet]")  # Reduced from 0.6
-    filter_complex.append("[dialogue]volume=3.0[dialogue_loud]")  # Increased from 2.0
-    filter_complex.append("[bg_quiet][dialogue_loud]amix=inputs=2:duration=first:dropout_transition=0[out]")
+    # CRITICAL: normalize=0 prevents amix from dividing volume by number of inputs
+    # Without this, each segment's volume = 1/N where N = total segments, causing very low audio
+    # that increases as segments finish playing
+    filter_complex.append(f"{mix_str}amix=inputs={len(tts_audio_files)}:dropout_transition=0:normalize=0[dialogue]")
+    filter_complex.append("[bg]volume=0.4[bg_quiet]")  # Background slightly lower
+    filter_complex.append("[dialogue]volume=2.5[dialogue_loud]")  # Dialogue boost (normalized now, so less needed)
+    filter_complex.append("[bg_quiet][dialogue_loud]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[out]")
 
     full_filter = ";".join(filter_complex)
     

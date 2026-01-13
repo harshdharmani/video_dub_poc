@@ -27,15 +27,33 @@ SUPPORTED_LANGUAGES = {
 class Translator:
     def __init__(self, target_language: str = "hi"):
         """
-        Initializes the Google Gemini Translator.
+        Initializes the Google Gemini Translator using Vertex AI with GCP credentials.
+
+        Uses environment variables:
+            - GOOGLE_APPLICATION_CREDENTIALS: Path to service account JSON key
+            - GCP_PROJECT_ID: Google Cloud project ID
+            - GCP_REGION: Region for Vertex AI (e.g., us-central1)
+            - GEMINI_MODEL: Model name (e.g., gemini-2.5-flash)
 
         Args:
             target_language: Language code (hi, ta, te, kn, ml, etc.)
                              Defaults to Hindi for backward compatibility.
         """
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY not found. Please add it to your .env file.")
+        # Get GCP configuration from environment
+        gcp_project = os.getenv("GCP_PROJECT_ID")
+        # Use GEMINI_REGION if set, otherwise fallback to us-central1 (Required for Vertex AI models)
+        # CRITICAL: Do NOT set this to 'us' (multi-region) as it causes 404 errors for prediction endpoints.
+        gcp_region = os.getenv("GEMINI_REGION", "us-central1")
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+        # Validate required environment variables
+        if not gcp_project:
+            raise RuntimeError("GCP_PROJECT_ID not found. Please add it to your .env file.")
+        if not credentials_path:
+            raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS not found. Please add it to your .env file.")
+        if not os.path.exists(credentials_path):
+            raise RuntimeError(f"Service account key file not found at: {credentials_path}")
 
         if target_language not in SUPPORTED_LANGUAGES:
             raise ValueError(f"Unsupported language: {target_language}. Supported: {list(SUPPORTED_LANGUAGES.keys())}")
@@ -43,11 +61,17 @@ class Translator:
         self.target_language = target_language
         self.language_name = SUPPORTED_LANGUAGES[target_language]
 
-        # New client‑based initialization
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-2.5-flash"
+        # Initialize Vertex AI client with GCP credentials
+        # The GOOGLE_APPLICATION_CREDENTIALS env var is automatically used by the client
+        self.client = genai.Client(
+            vertexai=True,
+            project=gcp_project,
+            location=gcp_region
+        )
+        self.model_name = gemini_model
 
         print(f"🌐 Translator initialized for: {self.language_name} ({target_language})")
+        print(f"   Using Vertex AI: Project={gcp_project}, Region={gcp_region}, Model={gemini_model}")
 
     def translate_segments(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -163,7 +187,7 @@ Return ONLY the JSON array, no other text."""
                         success = True
                         break # Success, exit retry loop
                     else:
-                        print(f"  ⚠️ Warning: Batch {i//BATCH_SIZE + 1} returned None (empty). Retrying...")
+                        print(f"  ⚠️ Warning: Batch {i//BATCH_SIZE + 1} returned None (empty). Raw Response: {response.text}")
                         # This can happen on transient model errors, so we SHOULD retry
                         # Fall through to exception-like retry logic
                         time.sleep(2)

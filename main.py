@@ -7,7 +7,6 @@ from core.separator import separate_audio
 from core.transcribe import transcribe_audio
 from core.translator import Translator, SUPPORTED_LANGUAGES
 from core.dubbing import generate_dubbed_audio
-from core.transcribe import LANGUAGE_MODEL_MAP
 
 # ============================================================
 # CONFIGURATION - EDIT THESE VALUES
@@ -58,10 +57,10 @@ print(f"✅ Audio extracted: {ORIGINAL_AUDIO}")
 vocals_path, background_path = separate_audio(ORIGINAL_AUDIO)
 
 # ============================================================
-# STEP 3: Transcribe Vocals (Deepgram)
+# STEP 3: Transcribe Vocals (Google Cloud Speech-to-Text)
 # ============================================================
 print("=" * 50)
-print(f"STEP 3: Transcribing vocals ({SOURCE_LANGUAGE})")
+print(f"STEP 3: Transcribing vocals with Google STT ({SOURCE_LANGUAGE})")
 print("=" * 50)
 utterances = transcribe_audio(vocals_path, source_language=SOURCE_LANGUAGE)
 print(f"✅ Got {len(utterances)} utterances")
@@ -82,7 +81,7 @@ print(f"✅ Translated {len(translated_segments)} segments")
 # ============================================================
 # STEP 5 & 6: Generate TTS + Mix with Background
 # ============================================================
-generate_dubbed_audio(background_path, translated_segments, DUBBED_AUDIO)
+generate_dubbed_audio(background_path, translated_segments, DUBBED_AUDIO, language=TARGET_LANGUAGE)
 
 # ============================================================
 # STEP 7: Merge Audio with Video
