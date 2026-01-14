@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dubbing Results - AI Video Dubber</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="container wide">
+        <header>
+            <h1>Dubbing Complete 🎉</h1>
+            <a href="/" class="back-link">← Dub Another Video</a>
+        </header>
+
+        <div class="grid-layout">
+            <!-- Video Column -->
+            <div class="column video-col">
+                <div class="card">
+                    <h2>Dubbed Video ({{ target_lang }})</h2>
+                    <video controls autoplay class="video-player">
+                        <source src="{{ output_video }}" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                    <div class="download-actions">
+                        <a href="{{ output_video }}" download class="btn-secondary">Download Video</a>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stats & Transcript Column -->
+            <div class="column stats-col">
+                <div class="card timing-card">
+                    <h2>Performance Stats</h2>
+                    <div class="stat-grid">
+                        {% if upload_time > 0 %}
+                        <div class="stat-item">
+                            <span class="label">Upload Time</span>
+                            <span class="value">{{ "%.2f"|format(upload_time) }}s</span>
+                        </div>
+                        {% endif %}
+                        {% if download_time > 0 %}
+                        <div class="stat-item">
+                            <span class="label">Download Time</span>
+                            <span class="value">{{ "%.2f"|format(download_time) }}s</span>
+                        </div>
+                        {% endif %}
+                        <div class="stat-item highlight">
+                            <span class="label">Total Processing</span>
+                            <span class="value">{{ "%.2f"|format(timings['total_dubbing']) }}s</span>
+                        </div>
+                    </div>
+
+                    <details>
+                        <summary>Detailed Breakdown</summary>
+                        <ul class="breakdown-list">
+                            <li>Extraction: {{ "%.2f"|format(timings['extract_audio']) }}s</li>
+                            <li>Transcription: {{ "%.2f"|format(timings['transcribe']) }}s</li>
+                            <li>Translation: {{ "%.2f"|format(timings['translate']) }}s</li>
+                            <li>Synthesis: {{ "%.2f"|format(timings['synthesize']) }}s</li>
+                            <li>Merging: {{ "%.2f"|format(timings['merge_video']) }}s</li>
+                        </ul>
+                    </details>
+                </div>
+
+                <div class="card transcript-card">
+                    <h2>Transcription</h2>
+                    <div class="transcript-box">
+                        <pre>{{ transcription }}</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>

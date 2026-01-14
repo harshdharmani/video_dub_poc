@@ -1,107 +1,110 @@
 import os
-import subprocess
+import time
+import shutil
+import uvicorn
+from fastapi import FastAPI, Request, Form, UploadFile, File
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from core.pipeline import process_video
+from core.translator import SUPPORTED_LANGUAGES
 
-# Core modules
-from core.audioextractor import extract_audio
-from core.separator import separate_audio
-from core.transcribe import transcribe_audio
-from core.translator import Translator, SUPPORTED_LANGUAGES
-from core.dubbing import generate_dubbed_audio
+app = FastAPI()
 
-# ============================================================
-# CONFIGURATION - EDIT THESE VALUES
-# ============================================================
-# Source language of the video (for transcription)
-# Use "multi" for auto-detect (recommended for mixed language videos)
-# Supported: multi (auto), en, hi, ta, te, kn, ml, mr, bn, gu, pa, or, as
-SOURCE_LANGUAGE = "multi"
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/output", StaticFiles(directory="output"), name="output")
 
-# Target language for dubbing (for translation + TTS)
-# Supported: en, hi, ta, te, kn, ml, mr, bn, gu, pa, or, as
-TARGET_LANGUAGE = "hi"
+# Templates
+templates = Jinja2Templates(directory="templates")
 
-# Input video path - change this to your video file
-VIDEO_PATH = "input/sample.mp4"
-
-# Output paths (auto-generated based on input filename and target language)
-video_basename = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
-ORIGINAL_AUDIO = f"audio/{video_basename}_original.wav"
-DUBBED_AUDIO = f"audio/{video_basename}_dubbed_{TARGET_LANGUAGE}.aac"
-OUTPUT_VIDEO = f"output/{video_basename}_{TARGET_LANGUAGE}.mp4"
-
-os.makedirs("audio", exist_ok=True)
+# Ensure directories exist
+os.makedirs("input", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
-# Display config
-TARGET_LANG_NAME = SUPPORTED_LANGUAGES.get(TARGET_LANGUAGE, "Unknown")
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "languages": SUPPORTED_LANGUAGES
+    })
 
-print("=" * 50)
-print(f"🎬 VIDEO DUBBING PIPELINE")
-print(f"   Input:  {VIDEO_PATH}")
-print(f"   Source: {SOURCE_LANGUAGE} → Target: {TARGET_LANG_NAME} ({TARGET_LANGUAGE})")
-print(f"   Output: {OUTPUT_VIDEO}")
-print("=" * 50)
+@app.post("/process", response_class=HTMLResponse)
+async def process_dubbing(
+    request: Request,
+    source_lang: str = Form(...),
+    target_lang: str = Form(...),
+    video_file: UploadFile = File(None),
+    youtube_url: str = Form(None)
+):
+    upload_time = 0.0
+    download_time = 0.0
+    video_path = ""
+    
+    # Validation
+    if not video_file and not youtube_url:
+        return templates.TemplateResponse("index.html", {
+            "request": request,
+            "error": "Please upload a video or provide a YouTube link.",
+            "languages": SUPPORTED_LANGUAGES
+        })
 
-# ============================================================
-# STEP 1: Extract Audio from Video
-# ============================================================
-print("=" * 50)
-print("STEP 1: Extracting audio from video")
-print("=" * 50)
-extract_audio(VIDEO_PATH, ORIGINAL_AUDIO)
-print(f"✅ Audio extracted: {ORIGINAL_AUDIO}")
+    try:
+        if youtube_url:
+            # Handle YouTube URL
+            import yt_dlp
+            print(f"Downloading YouTube URL: {youtube_url}")
+            t0 = time.time()
+            
+            ydl_opts = {
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'outtmpl': 'input/%(title)s.%(ext)s',
+                'noplaylist': True,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+                filename = ydl.prepare_filename(info)
+                video_path = filename
+            
+            download_time = time.time() - t0
+            print(f"Download finished: {video_path} in {download_time:.2f}s")
+            
+        elif video_file:
+            # Handle File Upload
+            t0 = time.time()
+            video_path = f"input/{video_file.filename}"
+            print(f"Saving uploaded file to: {video_path}")
+            
+            with open(video_path, "wb") as buffer:
+                shutil.copyfileobj(video_file.file, buffer)
+            
+            upload_time = time.time() - t0
+            print(f"Upload finished in {upload_time:.2f}s")
 
-# ============================================================
-# STEP 2: Separate Vocals + Background (Demucs)
-# ============================================================
-vocals_path, background_path = separate_audio(ORIGINAL_AUDIO)
+        # Process Video
+        result = process_video(video_path, source_lang, target_lang)
+        
+        # Prepare context for result page
+        return templates.TemplateResponse("result.html", {
+            "request": request,
+            "upload_time": upload_time,
+            "download_time": download_time,
+            "timings": result["timings"],
+            "transcription": result["transcription"],
+            "output_video": f"/output/{os.path.basename(result['output_video_path'])}",
+            "source_lang": source_lang,
+            "target_lang": target_lang
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return templates.TemplateResponse("index.html", {
+            "request": request,
+            "error": f"Error processing video: {str(e)}",
+            "languages": SUPPORTED_LANGUAGES
+        })
 
-# ============================================================
-# STEP 3: Transcribe Vocals (Google Cloud Speech-to-Text)
-# ============================================================
-print("=" * 50)
-print(f"STEP 3: Transcribing vocals with Google STT ({SOURCE_LANGUAGE})")
-print("=" * 50)
-utterances = transcribe_audio(vocals_path, source_language=SOURCE_LANGUAGE)
-print(f"✅ Got {len(utterances)} utterances")
-
-for utt in utterances[:3]:  # Show first 3
-    print(f"  [Speaker {utt.get('speaker', 0)}] [{utt['start']:.1f}s - {utt['end']:.1f}s]: {utt['transcript'][:50]}...")
-
-# ============================================================
-# STEP 4: Translate to Target Language
-# ============================================================
-print("=" * 50)
-print(f"STEP 4: Translating to {TARGET_LANG_NAME}")
-print("=" * 50)
-translator = Translator(target_language=TARGET_LANGUAGE)
-translated_segments = translator.translate_segments(utterances)
-print(f"✅ Translated {len(translated_segments)} segments")
-
-# ============================================================
-# STEP 5 & 6: Generate TTS + Mix with Background
-# ============================================================
-generate_dubbed_audio(background_path, translated_segments, DUBBED_AUDIO, language=TARGET_LANGUAGE)
-
-# ============================================================
-# STEP 7: Merge Audio with Video
-# ============================================================
-print("=" * 50)
-print("STEP 7: Merging dubbed audio with video")
-print("=" * 50)
-subprocess.run([
-    "ffmpeg", "-y",
-    "-i", VIDEO_PATH,
-    "-i", DUBBED_AUDIO,
-    "-map", "0:v:0",
-    "-map", "1:a:0",
-    "-c:v", "copy",
-    "-c:a", "copy",
-    "-shortest",
-    OUTPUT_VIDEO
-], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-print("=" * 50)
-print("🎬 DUBBING COMPLETE!")
-print(f"   Output: {OUTPUT_VIDEO}")
-print("=" * 50)
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="127.0.0.1", port=5000, reload=True)
